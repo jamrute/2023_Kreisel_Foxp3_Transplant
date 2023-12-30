@@ -1,0 +1,276 @@
+```{r}
+library(Seurat)
+library(dplyr)
+library(tidyr)
+library(glmGamPoi)
+library(SeuratObject)
+library(sctransform)
+library(harmony)
+library(Rcpp)
+library(ggplot2)
+library(patchwork)
+library(tidyverse)
+library(DescTools)
+library(ggalluvial)
+
+
+
+`%ni%` <- Negate(`%in%`)
+
+data_raw <- Read10X('sample_feature_bc_matrix')
+data_raw <- Read10X('filtered_feature_bc_matrix')
+filtered_contig <- read.csv('filtered_contig_annotations.csv')
+data <- CreateSeuratObject(data_raw$'Gene Expression')
+tcr_meta <- data.frame('barcode' = filtered_contig$barcode, 
+                       'clonotype_id' = filtered_contig$raw_clonotype_id,
+                       'cdr3_aa' = filtered_contig$cdr3,
+                       'chain' = filtered_contig$chain)
+tcr_meta_tra <- tcr_meta %>% filter(chain == 'TRA')
+tcr_meta_trb <- tcr_meta %>% filter(chain == 'TRB')
+tcr_meta_tra$chain = NULL
+tcr_meta_trb$chain = NULL
+colnames(tcr_meta_tra) <- c("barcode", "clonotype_id", "cdr3_aa_TRA")
+colnames(tcr_meta_trb) <- c("barcode", "clonotype_id", "cdr3_aa_TRB")
+tcr_meta <- merge(tcr_meta_tra, tcr_meta_trb, by='barcode', all=T)
+tcr_meta <- tcr_meta %>% mutate(clonotype_id = coalesce(clonotype_id.x, clonotype_id.y))
+
+tcr_meta$clonotype_id.x = NULL
+tcr_meta$clonotype_id.y = NULL
+
+#Remove multiple assignments for alpha and/or beta chains
+duplicates  <- tcr_meta$barcode[duplicated(tcr_meta$barcode)]
+tcr_meta <- tcr_meta %>% filter(barcode %ni% duplicates)
+
+# Delete cells with only one: TRA or TRB
+tcr_meta <- tcr_meta[complete.cases(tcr_meta), ]
+row.names(tcr_meta) <- tcr_meta$barcode
+
+#Add metadata to object
+data = AddMetaData(data, tcr_meta)
+
+#Add ADT data to object
+data[['ADT']] <-  CreateAssayObject(counts = data_raw$`Antibody Capture`)
+
+#Remove cells containing 'NA'
+data$barcode <- colnames(data)
+data <- subset(data, subset = barcode %in% tcr_meta$barcode)
+
+#Baseline cell count 
+ncol(data1) #1908 cells
+ncol(data2) #2565 cells
+
+#Perform QC
+data1 <- PercentageFeatureSet(data1, pattern = "^mt-", col.name = "percent.mt")
+data2 <- PercentageFeatureSet(data2, pattern = "^mt-", col.name = "percent.mt")
+VlnPlot(data1, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(data2, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+data1 <- subset(data1, subset = nFeature_RNA > 500 & nFeature_RNA < 10000 & percent.mt < 5)
+data2 <- subset(data2, subset = nFeature_RNA > 500 & nFeature_RNA < 10000 & percent.mt < 5)
+ncol(data1) #1756 cells
+ncol(data2) #2401 cells
+
+#Add relevant metadata
+data1$sample <- "tcr1"
+data2$sample <- "tcr2"
+
+#Cell cycle regression
+s.genes <- c("Mcm5", "Pcna", "Tyms", "Fen1", "Mcm2", "Mcm4", "Rrm1", "Ung", "Gins2", "Mcm6", "Cdca7", "Dtl", "Prim1", "Uurf1", "Cenpu", "Hells", "Rfc2", "Rpa2", "Nasp", "Rad51ap1", "Gmnn", "Wdr76", "Slbp", "Ccne2", "Ubr7", "Pold3", "Msh2", "Atad2", "Rad51", "Rrm2", "Cdc45", "Cdc6", "Exo1", "Tipin", "Dscc1", "Blm", "Casp8ap2", "Usp1", "Clspn", "Pola1", "Chaf1b", "Brip1", "E2f8")
+g2m.genes <- c("Hmgb2", "Cdk1", "Nusap1", "Ube2c", "Birc5", "Tpx2", "Top2a", "Ndc80", "Cks2", "Nuf2", "Cks1b", "Mki67", "Tmpo", "Cenpf", "Tacc3", "Pimreg", "Smc4", "Ccnb2", "Ckap2l", "Ckap2", "Aurkb", "Bub1", "Kif11", "Anp32e", "Tubb4b", "Gtse1", "Kif20b", "Hjurp", "Cdca3", "Jpt1", "Cdc20", "Ttk", "Cdc25c", "Kif2c", "Rangap1", "Ncapd2", "Dlgap5", "Cdca2", "Cdca8", "Ect2", "Kif23", "Hmmr", "Aurka", "Psrc1", "Anln", "Lbr", "Ckap5", "Cenpe", "Ctcf", "Nek2", "G2e3", "Gas2l3", "Cbx5", "Cenpa")
+data1 <- CellCycleScoring(data1, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+data2 <- CellCycleScoring(data2, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+data1$CC.Difference <- data1$S.Score-data1$G2M.Score
+data2$CC.Difference <- data2$S.Score-data2$G2M.Score
+
+#Integration
+tcr.list <- c(data1, data2)
+tcr.list <- lapply(X = tcr.list, FUN = function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)})
+features <- SelectIntegrationFeatures(object.list = tcr.list)
+tcr.anchors <- FindIntegrationAnchors(object.list = tcr.list, anchor.features = features)
+
+#Create 'integrated' data assay
+tcr.combined <- IntegrateData(anchorset = tcr.anchors)
+
+# Run the standard workflow for visualization and clustering
+DefaultAssay(tcr.combined) <- "integrated"
+tcr.combined <- ScaleData(tcr.combined, verbose = FALSE)
+tcr.combined <- RunPCA(tcr.combined, npcs = 30, verbose = FALSE)
+tcr.combined <- RunUMAP(tcr.combined, reduction = "pca", dims = 1:30)
+tcr.combined <- FindNeighbors(tcr.combined, reduction = "pca", dims = 1:30)
+tcr.combined <- FindClusters(tcr.combined, resolution = 0.5)
+
+# Hashtag (ADT) data
+tcr.combined <- NormalizeData(tcr.combined, assay = "ADT", normalization.method = "CLR")
+
+#Perform HTODemux to assign cells back to ADT samples 
+tcr.combined <- HTODemux(tcr.combined, assay = "ADT", positive.quantile = 0.99)
+
+#Remove doublets
+Idents(tcr.combined) <- "ADT_classification.global"
+tcr.combined <- subset(tcr.combined, idents = "Singlet")
+ncol(tcr.combined)
+
+#Create key for ADT and RNA assays (can be specified by rna_ or adt_)
+Key(tcr.combined[["RNA"]])
+Key(tcr.combined[["ADT"]])
+
+#RunHarmony
+DefaultAssay(tcr.combined) <- 'RNA'
+tcr.combined <- SCTransform(tcr.combined, vars.to.regress = c("percent.mt", "CC.Difference"), method = "glmGamPoi", return.only.var.genes=FALSE)
+tcr.combined <- RunPCA(tcr.combined, features = VariableFeatures(object = tcr.combined), npcs=100, verbose=TRUE)
+tcr.combined <- RunHarmony(object = tcr.combined, assay.use = "SCT", reduction = "pca", dims.use = 1:50, group.by.vars = "ADT_maxID", plot_convergence = TRUE)
+tcr.combined <- RunUMAP(object = tcr.combined, assay = "SCT", reduction = "harmony", dims = 1:50)
+tcr.combined <- FindNeighbors(object = tcr.combined, assay = "SCT", reduction = "harmony", dims = 1:50)
+tcr.combined <- FindClusters(tcr.combined, graph.name = "SCT_snn", algorithm = 3, resolution = c(0.1,0.2,0.3,0.4,0.5), verbose = FALSE)
+Idents(tcr.combined) <- "SCT_snn_res.0.5"
+
+metadata <- tcr.combined@meta.data
+metadata$hashtag <- NA
+metadata$hashtag[which(str_detect(metadata$ADT_maxID, "A-RejLungTreg-TotalSeqC"))] <- "A"
+metadata$hashtag[which(str_detect(metadata$ADT_maxID, "B-TolLungCD4-TotalSeqC"))] <- "B"
+metadata$hashtag[which(str_detect(metadata$ADT_maxID, "C-TolLungTreg-TotalSeqC"))] <- "C"
+metadata$hashtag[which(str_detect(metadata$ADT_maxID, "D-TolSpleenTreg-TotalSeqC"))] <- "D"
+tcr.combined@meta.data <- metadata
+
+#Evaluating differential gene expression and HeatMap
+Idents(tcr.combined)<-"hashtag"
+subset <- subset(tcr.combined, subset = c(“C”, “D”))
+response <- FindMarkers(subset, ident.1 = "C ", ident.2 = "D", verbose = FALSE, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+genes <- c(“Gramd3”, “Areg”, “Hopx”, “Ctla4”, “Got1”, “Dgat1”, “Nr4a1”, “Dusp1”, “Crem”, “Tnfaip3”, “Il1rl1”, “Lmna”, “Nsg2”, “Evl”, “Tcf7”, “Ms4a4b”, “Dtx1”, “Txnip”, “Tspan32”, “Id3”, “Limd2”, “Ptpn7”, “Ptpn6”, “Clec2d”)
+library(magick)
+library(dittoheatmap)
+if (requireNamespace("ComplexHeatmap"))
+  dittoHeatmap(subset, genes, annot.by = "ident", order.by = "ident", show_colnames = FALSE, heatmap.colors = colorRampPalette(c("lightblue", "white", "darkblue"))(14), annot.colors = c("#E5E2E2", "#BFC5CB"), complex = TRUE, use_raster=TRUE)
+
+### TCR analysis ###
+## Filtering, clonotype assignment ##
+
+tcr <- list()
+tcr[['MGI3492']] <- read.csv('MGI3492_DKAA_1_9.22.22/filtered_contig_annotations.csv')
+tcr[['MGI3579']] <- read.csv('MGI3579_DKAA_1_9.26.22/filtered_contig_annotations.csv')
+
+for(dataset in names(tcr)){
+  tra <- tcr[[dataset]] %>% filter(chain == 'TRA')
+  trb <-  tcr[[dataset]] %>% filter(chain == 'TRB')
+  
+  tra_duplicated_barcodes <- tra[duplicated(tra$barcode),'barcode']
+  trb_duplicated_barcodes <- trb[duplicated(trb$barcode),'barcode']
+  
+  tra_productive_barcodes <- tra$barcode[which(tra$barcode %ni% tra_duplicated_barcodes)]
+  trb_productive_barcodes <- trb$barcode[which(trb$barcode %ni% trb_duplicated_barcodes)]
+  
+  overlap <- trb_productive_barcodes[which(trb_productive_barcodes %in% tra_productive_barcodes)]
+  tcr[[dataset]] <-  tcr[[dataset]] %>% filter(barcode %in% overlap)
+}
+
+tcr[['MGI3492']]$dataset <- 'MGI3492'
+tcr[['MGI3579']]$dataset <- 'MGI3579'
+tcr <- rbind(tcr[['MGI3492']], tcr[['MGI3579']])
+
+tcr.combined$barcode <- gsub('\\_.', '', colnames(tcr.combined))
+tcr.combined$Cell_id <- colnames(tcr.combined)
+tcr = tcr %>% filter(barcode %in% tcr.combined$barcode)
+tcr = merge(tcr, tcr.combined@meta.data[, c('barcode', 'HTO_classification', 'dataset', 'Cell_id')], by=c('barcode', 'dataset'),
+            all.x = T, all.y = F)
+tcr$HTO_classification <- as.character(tcr$HTO_classification)
+tcr <- tcr[complete.cases(tcr),]
+
+clonotype_result <- NULL
+for(class in unique(tcr$HTO_classification)){
+  slice <- tcr %>% filter(HTO_classification == class)
+  tra <- slice %>% filter(chain == 'TRA')
+  trb <- slice %>% filter(chain == 'TRB')
+  
+  tra$tra_chain <- paste(tra$cdr3_nt, tra$v_gene, tra$j_gene)
+  trb$trb_chain <- paste(trb$cdr3_nt, trb$v_gene, trb$j_gene)
+  
+  tra_trb <- merge(tra[, c('tra_chain', 'Cell_id')], trb[, c('trb_chain', 'Cell_id')], by='Cell_id')
+  tra_trb <- tra_trb %>% group_by(tra_chain, trb_chain) %>% summarise('Clones' = length(Cell_id),  Cell_id=paste(Cell_id, collapse = ';'))
+  tra_trb$Clone_id <- paste('Clone', 1:length(tra_trb$Clones), class , sep='_')
+  tra_trb = separate_rows(tra_trb, Cell_id, sep = ";", convert = FALSE)
+  clonotype_result <- rbind(tra_trb, clonotype_result)
+}
+
+tcr = merge(tcr, clonotype_result[, c('Cell_id', 'Clone_id')], by='Cell_id')
+tcr$Clone_id <- paste(tcr$Clone_id, tcr$dataset, sep='_')
+tcr$raw_clonotype_id = NULL
+tcr$raw_consensus_id = NULL
+tcr$exact_subclonotype_id = NULL
+
+## Diversity ##
+
+diversity_result = NULL
+for(celltype in unique(tcr$HTO_classification)){
+  cluster = tcr %>% filter(HTO_classification == celltype)
+  for(data in unique(cluster$dataset)){
+    cluster_tube <- cluster %>% filter(dataset == data)
+    counts <- cluster_tube %>% group_by(Clone_id) %>% summarise(nCount = length(unique(Cell_id)))
+    gini_coef = Gini(counts$nCount, unbiased=FALSE)
+    result = data.frame('dataset' = data, 'HTO_classification' = celltype, 'Gini_coef' = gini_coef)
+    diversity_result <- rbind(diversity_result, result)
+    
+  }
+}
+diversity_result$HTO_classification <- gsub('-TotalSeqC', '', diversity_result$HTO_classification)
+diversity_result <- diversity_result %>% filter(HTO_classification %in% c('C-TolLungTreg', 'D-TolSpleenTreg'))
+ggplot(diversity_result, aes(x=HTO_classification, y=Gini_coef)) + 
+  geom_bar(stat = "summary", fun.y = "mean", aes(fill=HTO_classification)) +
+  geom_point(size = 2.5, aes(shape=dataset)) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"), plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        axis.text.x=element_text(size=10, face = 'bold', angle = 90), axis.text.y=element_text(size=10, face = 'bold'), 
+        axis.title.x = element_text(size = 10, face= 'bold'),
+        axis.title.y = element_text(size = 10, face= 'bold'),
+        strip.text = element_text(size=11)) + 
+  ylab('Gini coefficient') + xlab("Condition") + scale_fill_manual(values = c('#9BA5C8', '#CDCFD9')) +
+  scale_shape_manual(values=c(1,2))
+
+## N cells in clonotype ##
+
+tra <- tcr %>% filter(chain == 'TRA')
+trb <- tcr %>% filter(chain == 'TRB')
+tra$tra_chain <- paste(tra$cdr3_nt, tra$v_gene, tra$j_gene)
+trb$trb_chain <- paste(trb$cdr3_nt, trb$v_gene, trb$j_gene)
+shared_clones <- merge(tra[, c('tra_chain', 'Cell_id', 'Clone_id', 'HTO_classification', 'dataset', 'cdr3', 'v_gene', 'j_gene')], 
+                       trb[, c('trb_chain', 'Cell_id', 'cdr3', 'v_gene', 'j_gene')], by='Cell_id')
+shared_clones <- shared_clones  %>% filter(HTO_classification %in% c('C-TolLungTreg-TotalSeqC', 'D-TolSpleenTreg-TotalSeqC'))
+shared_clones$cdr3 <- paste(shared_clones$cdr3.x, shared_clones$cdr3.y, sep=';')
+shared_clones$v_gene <- paste(shared_clones$v_gene.x, shared_clones$v_gene.y, sep=';')
+shared_clones$j_gene <- paste(shared_clones$j_gene.x, shared_clones$j_gene.y, sep=';')
+shared_clones <- shared_clones %>% group_by(tra_chain, trb_chain) %>% summarise(Clone_id = paste(unique(Clone_id), collapse = ';'), 
+                                                                                Condition = paste(unique(HTO_classification), collapse = ';'),
+                                                                                Dataset =  paste(unique(dataset), collapse = ';'),
+                                                                                N = length(unique(HTO_classification)),
+                                                                                CDR3 = paste(unique(cdr3), collapse = ';'),
+                                                                                V = paste(unique(v_gene), collapse = ';'),
+                                                                                J = paste(unique(j_gene), collapse = ';'))
+shared_clones <- shared_clones %>% filter(N > 1)
+shared_clones$Shared_clone_id <- paste('Shared_clone', 1:28, sep = '_')
+clones_id <- shared_clones %>% separate_rows(Clone_id, sep = ';')
+total_c_clones <- clones_id$Clone_id[grepl('C-TolLungTreg', clones_id$Clone_id)]
+total_d_clones <- clones_id$Clone_id[grepl('D-TolSpleenTreg', clones_id$Clone_id)]
+shared_clones_ncells <- tcr %>% filter(Clone_id %in% c(clones_id$Clone_id))
+shared_clones_ncells <- shared_clones_ncells %>% group_by(Clone_id) %>% summarise(N_cells = length(unique(Cell_id)))
+shared_clones_ncells <- merge(shared_clones_ncells, clones_id[, c('Clone_id', 'Shared_clone_id')], by='Clone_id')
+shared_clones_ncells$Condition <- gsub('Clone_.{1,3}_|-TotalSeqC.+', '', shared_clones_ncells$Clone_id)
+top <- shared_clones_ncells %>% group_by(Shared_clone_id) %>% summarise(Overall_cells = sum(N_cells))
+top <- top %>% filter(Overall_cells > 3)
+shared_clones_ncells <- shared_clones_ncells %>% filter(Shared_clone_id %in% top$Shared_clone_id)
+
+
+ggplot(shared_clones_ncells,
+       aes(x = Condition, stratum = Shared_clone_id, alluvium = Shared_clone_id,
+           y = N_cells, fill = Shared_clone_id, label=N_cells)) +
+  geom_lode() + geom_flow(curve_type = "cubic") +
+  geom_stratum(alpha = 0) + ylab('Number of cells in clonotype') + theme_classic() +
+  xlab("Condition") + 
+  theme(axis.text.x=element_text(size=10, face = 'bold'), 
+        axis.text.y=element_text(size=10, face = 'bold'),
+        axis.title.x = element_text(size = 10, face= 'bold'),
+        axis.title.y = element_text(size = 10, face= 'bold')) + scale_fill_manual(values = c('#867ca0',  '#978cb4', '#a89bc8',
+                                                                                             '#a89bc8',	'#b1a5ce',	'#b9afd3',	'#c2b9d9',	'#cbc3de',
+                                                                                             '#d4cde4',  '#dadee3',	'#ebeff5'))
+
+```
+
